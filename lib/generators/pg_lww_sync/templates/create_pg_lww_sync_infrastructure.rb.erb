@@ -1,0 +1,381 @@
+class CreatePgLwwSyncInfrastructure < ActiveRecord::Migration[6.1]
+  def change
+    execute "CREATE SCHEMA IF NOT EXISTS pg_lww_sync;"
+
+    # 1. Transactional outbox ledger
+    create_table "pg_lww_sync.pg_lww_changesets", id: :uuid, default: -> { "gen_random_uuid()" } do |t|
+      t.string   :table_schema,      null: false
+      t.string   :table_name,        null: false
+      t.string   :record_id,         null: false
+      t.string   :action_type,       null: false
+      t.jsonb    :changed_fields,    null: false
+      t.jsonb    :column_timestamps, null: false
+      t.bigint   :transaction_id,    null: false
+      t.datetime :committed_at,      null: false
+
+      # Tracks per-peer delivery state, e.g. { "eu_west": "success" }
+      t.jsonb    :processed_nodes,   null: false, default: {}
+
+      # 'pending' while awaiting delivery; 'success' once all peers are done.
+      # Per-node schema failures are recorded in processed_nodes, not here.
+      t.string   :status,            null: false, default: 'pending'
+
+    end
+
+    add_index "pg_lww_sync.pg_lww_changesets", [:status, :committed_at],
+              name: "idx_lww_changesets_polling"
+    add_index "pg_lww_sync.pg_lww_changesets", :transaction_id,
+              name: "idx_lww_changesets_tx_id"
+
+    # 2. PL/pgSQL functions
+    # All functions are static — they call pg_lww_sync.local_node_id() at
+    # runtime rather than having node_id baked in, so only local_node_id()
+    # needs to be recreated on boot when the config changes.
+    reversible do |dir|
+      dir.up do
+        # Placeholder local_node_id() installed by migration so the trigger
+        # function compiles. The real value is injected on every app boot
+        # via initialize_database_functions! which runs CREATE OR REPLACE.
+        execute <<~SQL
+          CREATE OR REPLACE FUNCTION pg_lww_sync.local_node_id()
+          RETURNS CHARACTER VARYING AS $$
+          BEGIN
+            RETURN 'uninitialized'::character varying;
+          END;
+          $$ LANGUAGE plpgsql IMMUTABLE;
+        SQL
+
+        execute <<~SQL
+          -- Trigger function: tables must have a single UUID PK named 'id'
+          -- and a JSONB column '__lww_ts' (added by sync_all_tables!).
+          -- Write key format: "000123456789.123456_node_id"
+          -- Built by calling local_node_id() at trigger-fire time so the
+          -- function itself is node-agnostic and never needs reinstalling.
+          CREATE OR REPLACE FUNCTION pg_lww_sync.log_lww_sync_changeset()
+          RETURNS TRIGGER AS $tg$
+          DECLARE
+            v_write_key         TEXT;
+            v_column_timestamps JSONB := '{}'::jsonb;
+            v_col               TEXT;
+            v_old_val           TEXT;
+            v_new_val           TEXT;
+            v_record_id         TEXT;
+            v_tx_id             BIGINT := pg_current_xact_id();
+          BEGIN
+            IF pg_is_in_recovery()
+               OR current_setting('session_replication_role', true) = 'replica'
+               OR current_setting('pg_lww_sync.applying_replication', true) = 'on'
+            THEN
+              IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+            END IF;
+
+            IF TG_OP = 'DELETE' THEN
+              v_record_id := OLD.id::TEXT;
+            ELSE
+              v_record_id := NEW.id::TEXT;
+              v_write_key := to_char(EXTRACT(EPOCH FROM clock_timestamp()), 'FM000000000000.000000')
+                             || '_' || pg_lww_sync.local_node_id();
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+              FOR v_col IN
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
+                  AND attnum > 0 AND NOT attisdropped AND attname NOT IN ('id', '__lww_ts')
+                ORDER BY attnum
+              LOOP
+                v_column_timestamps := v_column_timestamps || jsonb_build_object(v_col, v_write_key);
+              END LOOP;
+              NEW.__lww_ts := v_column_timestamps;
+
+            ELSIF TG_OP = 'UPDATE' THEN
+              v_column_timestamps := COALESCE(OLD.__lww_ts, '{}'::jsonb);
+              FOR v_col IN
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
+                  AND attnum > 0 AND NOT attisdropped AND attname NOT IN ('id', '__lww_ts')
+                ORDER BY attnum
+              LOOP
+                EXECUTE format('SELECT ($1).%I::text', v_col) INTO v_old_val USING OLD;
+                EXECUTE format('SELECT ($1).%I::text', v_col) INTO v_new_val USING NEW;
+                IF (v_old_val IS DISTINCT FROM v_new_val) THEN
+                  v_column_timestamps := v_column_timestamps || jsonb_build_object(v_col, v_write_key);
+                END IF;
+              END LOOP;
+              IF v_column_timestamps = COALESCE(OLD.__lww_ts, '{}'::jsonb) THEN RETURN NEW; END IF;
+              NEW.__lww_ts := v_column_timestamps;
+
+            ELSIF TG_OP = 'DELETE' THEN
+              NULL;
+            END IF;
+
+            DECLARE
+              v_outbox_timestamps JSONB := '{}'::jsonb;
+            BEGIN
+              IF TG_OP != 'DELETE' THEN
+                FOR v_col IN SELECT jsonb_object_keys(
+                  CASE TG_OP
+                    WHEN 'INSERT' THEN NEW.__lww_ts
+                    ELSE NEW.__lww_ts - COALESCE(OLD.__lww_ts, '{}'::jsonb)
+                  END
+                )
+                LOOP
+                  v_outbox_timestamps := v_outbox_timestamps
+                    || jsonb_build_object(v_col, NEW.__lww_ts->>v_col);
+                END LOOP;
+              END IF;
+
+              INSERT INTO pg_lww_sync.pg_lww_changesets (
+                table_schema, table_name, record_id, action_type,
+                changed_fields, column_timestamps, transaction_id,
+                committed_at, processed_nodes
+              ) VALUES (
+                TG_TABLE_SCHEMA, TG_TABLE_NAME, v_record_id, TG_OP,
+                CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE row_to_json(NEW) END,
+                v_outbox_timestamps, v_tx_id,
+                clock_timestamp(), '{}'::jsonb
+              );
+            END;
+
+            IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+          END;
+          $tg$ LANGUAGE plpgsql;
+        SQL
+      end
+
+        execute <<~SQL
+      -- Tables must have a single UUID primary key column named 'id'
+      -- and a JSONB column '__lww_ts' storing per-column write keys.
+      -- Write key format: "000123456789.123456_node_id"
+      --   - Zero-padded 12-digit Unix timestamp with 6 decimal places (microseconds)
+      --   - Underscore separator
+      --   - Origin node_id
+      -- Lexicographic TEXT comparison gives correct LWW ordering AND transitive
+      -- tiebreaking in a single operation — no separate origin_node_id column needed.
+      CREATE OR REPLACE FUNCTION pg_lww_sync.apply_lww_change(
+        p_table_schema   TEXT,
+        p_table_name     TEXT,
+        p_record_id      TEXT,
+        p_action_type    TEXT,
+        p_changed_fields JSONB,
+        p_column_timestamps JSONB,  -- keys: col name, values: write key strings
+        p_origin_node_id TEXT
+      ) RETURNS VOID AS $body$
+      DECLARE
+        v_col            TEXT;
+        v_incoming_key   TEXT;    -- composite write key from incoming changeset
+        v_local_key      TEXT;    -- composite write key stored in __lww_ts
+        v_update_sql     TEXT := '';
+        v_update_ts      JSONB;   -- new __lww_ts value to write on UPDATE
+        v_insert_cols    TEXT := '';
+        v_insert_vals    TEXT := '';
+        v_insert_ts      JSONB := '{}'::jsonb;  -- __lww_ts for INSERT
+        v_exists         BOOLEAN;
+        v_temp_table_name TEXT;
+        v_conflict_id    TEXT;
+        v_incoming_max_key TEXT;
+        v_local_max_key  TEXT;
+      BEGIN
+        IF p_record_id IS NULL THEN
+          RAISE EXCEPTION 'record_id cannot be NULL for %.%', p_table_schema, p_table_name;
+        END IF;
+
+        -- ----------------------------------------------------------------
+        -- DELETE path: unconditional. Any incoming delete wins.
+        -- __lww_ts is deleted with the row — no explicit cleanup needed.
+        -- Stale UPDATEs arriving later match 0 rows — natural no-op.
+        -- ----------------------------------------------------------------
+        IF p_action_type = 'DELETE' THEN
+          EXECUTE format('DELETE FROM %I.%I WHERE id = %L', p_table_schema, p_table_name, p_record_id);
+          RETURN;
+        END IF;
+
+        -- ----------------------------------------------------------------
+        -- Temp table: named per schema+table so multiple calls in the same
+        -- session for different tables never collide.
+        -- ----------------------------------------------------------------
+        v_temp_table_name := 't_lww_' || p_table_schema || '_' || p_table_name;
+        EXECUTE format(
+          'CREATE TEMP TABLE IF NOT EXISTS %I (LIKE %I.%I EXCLUDING ALL) ON COMMIT DROP',
+          v_temp_table_name, p_table_schema, p_table_name
+        );
+        EXECUTE format('TRUNCATE TABLE %I', v_temp_table_name);
+        EXECUTE format(
+          'INSERT INTO %I SELECT * FROM jsonb_populate_record(NULL::%I.%I, $1)',
+          v_temp_table_name, p_table_schema, p_table_name
+        ) USING p_changed_fields;
+
+        EXECUTE format(
+          'SELECT EXISTS(SELECT 1 FROM %I.%I WHERE id = %L)',
+          p_table_schema, p_table_name, p_record_id
+        ) INTO v_exists;
+
+        IF NOT v_exists THEN
+          -- INSERT path: build column list, resolve __lww_ts write keys
+          FOR v_col IN
+            SELECT attname FROM pg_attribute
+            WHERE attrelid = (quote_ident(p_table_schema) || '.' || quote_ident(p_table_name))::regclass
+              AND attnum > 0 AND NOT attisdropped AND attname NOT IN ('id', '__lww_ts')
+            ORDER BY attnum
+          LOOP
+            v_incoming_key := p_column_timestamps->>v_col;
+            IF v_incoming_key IS NOT NULL THEN
+              IF v_insert_cols != '' THEN
+                v_insert_cols := v_insert_cols || ', ';
+                v_insert_vals := v_insert_vals || ', ';
+              END IF;
+              v_insert_cols := v_insert_cols || format('%I', v_col);
+              v_insert_vals := v_insert_vals || format('(SELECT %I FROM %I)', v_col, v_temp_table_name);
+              v_insert_ts   := v_insert_ts || jsonb_build_object(v_col, v_incoming_key);
+            END IF;
+          END LOOP;
+
+          -- Include id and __lww_ts in the INSERT
+          v_insert_cols := CASE WHEN v_insert_cols != '' THEN v_insert_cols || ', id, __lww_ts' ELSE 'id, __lww_ts' END;
+          v_insert_vals := CASE WHEN v_insert_vals != '' THEN v_insert_vals || ', ' || quote_literal(p_record_id) || ', ' || quote_literal(v_insert_ts::text) ELSE quote_literal(p_record_id) || ', ' || quote_literal(v_insert_ts::text) END;
+
+          BEGIN
+            EXECUTE format(
+              'INSERT INTO %I.%I (%s) VALUES (%s)',
+              p_table_schema, p_table_name, v_insert_cols, v_insert_vals
+            );
+          EXCEPTION WHEN unique_violation THEN
+            -- FWW resolution for concurrent INSERTs with the same unique value.
+            -- Walk every unique non-PK index, compare write keys from __lww_ts.
+            -- Smaller key = earlier writer = survives (FWW matches single-node PG).
+            -- Loop because deleting one conflict may expose another.
+            DECLARE
+              v_idx_cols     TEXT[];
+              v_idx_where    TEXT;
+              v_idx_col      TEXT;
+              v_idx_col_val  TEXT;
+              v_retry_needed BOOLEAN := TRUE;
+              v_safety       INTEGER := 0;
+            BEGIN
+              WHILE v_retry_needed AND v_safety < 64
+              LOOP
+                v_retry_needed := FALSE;
+                v_safety := v_safety + 1;
+
+                FOR v_idx_cols IN
+                  SELECT array_agg(a.attname ORDER BY x.ordinality)
+                  FROM pg_index i
+                  JOIN pg_class c ON c.oid = i.indrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ordinality)
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = x.attnum
+                  WHERE n.nspname = p_table_schema AND c.relname = p_table_name
+                    AND i.indisunique AND NOT i.indisprimary
+                    AND a.attname != '__lww_ts'
+                  GROUP BY i.indexrelid
+                LOOP
+                  v_idx_where := '';
+                  FOREACH v_idx_col IN ARRAY v_idx_cols
+                  LOOP
+                    EXECUTE format('SELECT %I::TEXT FROM %I', v_idx_col, v_temp_table_name)
+                    INTO v_idx_col_val;
+                    IF v_idx_where != '' THEN v_idx_where := v_idx_where || ' AND '; END IF;
+                    IF v_idx_col_val IS NULL THEN
+                      v_idx_where := v_idx_where || format('%I IS NULL', v_idx_col);
+                    ELSE
+                      v_idx_where := v_idx_where || format('%I = %L', v_idx_col, v_idx_col_val);
+                    END IF;
+                  END LOOP;
+
+                  EXECUTE format('SELECT id::TEXT FROM %I.%I WHERE %s',
+                    p_table_schema, p_table_name, v_idx_where)
+                  INTO v_conflict_id;
+
+                  IF v_conflict_id IS NOT NULL THEN
+                    -- Get the MAX write key for the incoming record
+                    -- (MAX on text gives the lexicographically largest = most recent)
+                    -- COALESCE '' so a row with no __lww_ts always loses.
+                    SELECT COALESCE(max(value), '')
+                    INTO v_incoming_max_key
+                    FROM jsonb_each_text(v_insert_ts);
+
+                    -- Get the MAX write key stored in __lww_ts on the conflicting row
+                    EXECUTE format('SELECT COALESCE((SELECT max(val) FROM jsonb_each_text(__lww_ts) AS t(k,val)), '''') FROM %I.%I WHERE id = %L',
+                      p_table_schema, p_table_name, v_conflict_id)
+                    INTO v_local_max_key;
+
+                    -- FWW: smaller key = earlier writer = survives
+                    IF v_incoming_max_key < v_local_max_key OR v_local_max_key = '' THEN
+                      -- Incoming is older: delete local row (its __lww_ts goes with it)
+                      EXECUTE format('DELETE FROM %I.%I WHERE id = %L',
+                        p_table_schema, p_table_name, v_conflict_id);
+                      v_retry_needed := TRUE;
+                      EXIT;
+                    ELSE
+                      -- Local is older: discard incoming (no __lww_ts cleanup needed
+                      -- since the INSERT never committed; v_insert_ts is in-memory only)
+                      RETURN;
+                    END IF;
+                  END IF;
+                END LOOP;
+              END LOOP;
+
+              -- All conflicts resolved — retry the INSERT
+              EXECUTE format(
+                'INSERT INTO %I.%I (%s) VALUES (%s)',
+                p_table_schema, p_table_name, v_insert_cols, v_insert_vals
+              );
+            END;
+          END; -- unique_violation handler
+
+        ELSE
+          -- UPDATE path: per-column LWW using write key comparison.
+          -- If the record does not exist locally, discard — an UPDATE arriving
+          -- before its INSERT would write __lww_ts keys that corrupt the INSERT
+          -- path when it arrives (INSERT's older keys lose, columns are omitted).
+          IF NOT v_exists THEN
+            RETURN;
+          END IF;
+
+          -- Load the current __lww_ts from the local row
+          EXECUTE format('SELECT COALESCE(__lww_ts, ''{}''::jsonb) FROM %I.%I WHERE id = %L',
+            p_table_schema, p_table_name, p_record_id)
+          INTO v_update_ts;
+
+          FOR v_col IN
+            SELECT attname FROM pg_attribute
+            WHERE attrelid = (quote_ident(p_table_schema) || '.' || quote_ident(p_table_name))::regclass
+              AND attnum > 0 AND NOT attisdropped AND attname NOT IN ('id', '__lww_ts')
+            ORDER BY attnum
+          LOOP
+            v_incoming_key := p_column_timestamps->>v_col;
+            IF v_incoming_key IS NOT NULL THEN
+              v_local_key := v_update_ts->>v_col;
+              -- Single TEXT comparison: larger key = newer write = wins for LWW.
+              -- Tiebreak is embedded in the key (timestamp_node_id) so no
+              -- separate origin lookup is needed — fully transitive by design.
+              -- COALESCE '' so a column with no key (seeded/migrated) always loses.
+              IF v_incoming_key > COALESCE(v_local_key, '') THEN
+                IF v_update_sql != '' THEN v_update_sql := v_update_sql || ', '; END IF;
+                v_update_sql := v_update_sql || format('%I = (SELECT %I FROM %I)', v_col, v_col, v_temp_table_name);
+                v_update_ts  := v_update_ts || jsonb_build_object(v_col, v_incoming_key);
+              END IF;
+            END IF;
+          END LOOP;
+
+          IF v_update_sql != '' THEN
+            -- Write both the data columns and the updated __lww_ts atomically
+            v_update_sql := v_update_sql || format(', __lww_ts = %L::jsonb', v_update_ts::text);
+            EXECUTE format('UPDATE %I.%I SET %s WHERE id = %L',
+              p_table_schema, p_table_name, v_update_sql, p_record_id);
+          END IF;
+        END IF;
+      END;
+      $body$ LANGUAGE plpgsql;
+        SQL
+
+      end
+
+      dir.down do
+        execute "DROP FUNCTION IF EXISTS pg_lww_sync.apply_lww_change(TEXT, TEXT, TEXT, TEXT, JSONB, JSONB, TEXT);"
+        execute "DROP FUNCTION IF EXISTS pg_lww_sync.log_lww_sync_changeset();"
+        execute "DROP FUNCTION IF EXISTS pg_lww_sync.local_node_id();"
+      end
+    end
+  end
+end
