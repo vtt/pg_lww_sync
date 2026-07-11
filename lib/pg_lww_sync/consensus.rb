@@ -23,7 +23,7 @@ module PgLwwSync
         # File missing or corrupt — fall through to the safe path
       end
 
-      File.open(state_file, File::RDWR | File::CREAT, 0o644) do |f|
+      File.open(state_file, File::RDWR | File::CREAT, 0600) do |f|
         f.flock(File::LOCK_EX)
 
         f.rewind
@@ -45,7 +45,7 @@ module PgLwwSync
     end
 
     def self.invalidate_fast_path!
-      File.open(state_file, File::RDWR | File::CREAT, 0o644) do |f|
+      File.open(state_file, File::RDWR | File::CREAT, 0600) do |f|
         if f.flock(File::LOCK_EX | File::LOCK_NB)
           f.rewind
           f.write({ tick: 0, primary: {} }.to_json)
