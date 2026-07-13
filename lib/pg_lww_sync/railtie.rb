@@ -13,7 +13,7 @@ module PgLwwSync
             table_exists = ActiveRecord::Base.connection.select_value(<<~SQL)
               SELECT EXISTS (
                 SELECT FROM information_schema.tables
-                WHERE table_schema = 'pg_lww_sync' AND table_name = 'pg_lww_changesets'
+                WHERE table_schema = 'lww_sync' AND table_name = 'pg_lww_changesets'
               );
             SQL
 
@@ -22,7 +22,7 @@ module PgLwwSync
                 puts "PgLwwSync: Executing post-migration realignment..."
                 PgLwwSync.initialize_database_functions!
               else
-                puts "PgLwwSync: Sync disabled (node_id not set) — dropping triggers and truncating outbox."
+                puts "PgLwwSync: Sync disabled (node_id not set) — dropping triggers. Outbox left intact."
               end
               PgLwwSync.sync_all_tables!
             end

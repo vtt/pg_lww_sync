@@ -64,8 +64,86 @@ RSpec.describe PgLwwSync::Consumer do
   end
 
   # -------------------------------------------------------------------------
-  # process_transaction_bucket
+  # ordered_chains — merges transaction groups that share a record_id so
+  # they're delivered by a single worker in commit order. Regression coverage
+  # for a bug where merging 3+ pre-existing chains via one bridging
+  # transaction could self-merge a chain into itself, null it out mid-loop,
+  # and either crash or silently orphan a chain (defeating the ordering
+  # guarantee this method exists to provide).
   # -------------------------------------------------------------------------
+  describe '#ordered_chains' do
+    def tx_group(id, *record_ids)
+      [id, record_ids.map { |rid| { 'record_id' => rid } }]
+    end
+
+    it 'keeps independent transactions in separate chains' do
+      tx_groups = [tx_group('tx1', 'A'), tx_group('tx2', 'B')]
+      chains = consumer.ordered_chains(tx_groups)
+      expect(chains.size).to eq(2)
+    end
+
+    it 'merges two transactions sharing a record_id into one chain' do
+      tx_groups = [tx_group('tx1', 'A'), tx_group('tx2', 'A')]
+      chains = consumer.ordered_chains(tx_groups)
+      expect(chains.size).to eq(1)
+      expect(chains.first.map(&:first)).to eq(%w[tx1 tx2])
+    end
+
+    it 'merges 3+ pre-existing chains bridged by one transaction, without crashing or duplicating/losing transactions' do
+      # Establishes chain per record in an order where the discovered
+      # chain_indices for tx4 are NOT already ascending (C before A before B).
+      tx_groups = [
+        tx_group('tx1', 'C'),
+        tx_group('tx2', 'A'),
+        tx_group('tx3', 'B'),
+        tx_group('tx4', 'A', 'B', 'C'),
+      ]
+
+      chains = nil
+      expect { chains = consumer.ordered_chains(tx_groups) }.not_to raise_error
+
+      all_tx_ids = chains.flat_map { |chain| chain.map(&:first) }
+      expect(chains.size).to eq(1)
+      expect(all_tx_ids.sort).to eq(%w[tx1 tx2 tx3 tx4])
+    end
+
+    it 'handles every record ordering for a bridging transaction without crashing or corrupting chains' do
+      %w[A B C D E].permutation(5).each do |order|
+        tx_groups = [
+          tx_group('tx1', 'A'),
+          tx_group('tx2', 'B'),
+          tx_group('tx3', 'C'),
+          tx_group('tx4', 'D'),
+          tx_group('tx5', 'E'),
+          tx_group('tx6', *order),
+        ]
+
+        chains = consumer.ordered_chains(tx_groups)
+        all_tx_ids = chains.flat_map { |chain| chain.map(&:first) }
+
+        expect(chains.size).to eq(1), "expected 1 chain for order #{order}, got #{chains.size}"
+        expect(all_tx_ids.sort).to eq(%w[tx1 tx2 tx3 tx4 tx5 tx6])
+      end
+    end
+
+    it 'handles a sequence of bridging transactions that repeatedly re-merge chains' do
+      tx_groups = [
+        tx_group('tx1', 'A'),
+        tx_group('tx2', 'B'),
+        tx_group('tx3', 'C'),
+        tx_group('tx4', 'B', 'C'),
+        tx_group('tx5', 'A', 'B'),
+      ]
+
+      chains = consumer.ordered_chains(tx_groups)
+      all_tx_ids = chains.flat_map { |chain| chain.map(&:first) }
+
+      expect(chains.size).to eq(1)
+      expect(all_tx_ids.sort).to eq(%w[tx1 tx2 tx3 tx4 tx5])
+    end
+  end
+
+
   describe '#process_transaction_bucket (private)' do
     let(:node_b) { remote_node(node_id: 'node_b') }
 
@@ -188,8 +266,8 @@ RSpec.describe PgLwwSync::Consumer do
 
     subject(:sql) { consumer.send(:format_lww_sql_call, row, 'node_b') }
 
-    it 'calls pg_lww_sync.apply_lww_change' do
-      expect(sql).to include('pg_lww_sync.apply_lww_change')
+    it 'calls lww_sync.apply_lww_change' do
+      expect(sql).to include('lww_sync.apply_lww_change')
     end
 
     it 'passes record_id as plain TEXT (not ::jsonb)' do

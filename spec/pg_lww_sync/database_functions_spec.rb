@@ -32,7 +32,7 @@ RSpec.describe 'Database functions', :integration do
   # ---------------------------------------------------------------------------
   def apply_change(action:, record_id:, fields:, timestamps:, origin: 'node_b')
     conn.execute(<<~SQL)
-      SELECT pg_lww_sync.apply_lww_change(
+      SELECT lww_sync.apply_lww_change(
         'public', 'lww_test_widgets',
         #{conn.quote(record_id)},
         #{conn.quote(action)},
@@ -46,15 +46,15 @@ RSpec.describe 'Database functions', :integration do
   # -------------------------------------------------------------------------
   # local_node_id
   # -------------------------------------------------------------------------
-  describe 'pg_lww_sync.local_node_id()' do
+  describe 'lww_sync.local_node_id()' do
     it 'returns the configured node_id' do
-      expect(conn.select_value('SELECT pg_lww_sync.local_node_id();')).to eq('node_a')
+      expect(conn.select_value('SELECT lww_sync.local_node_id();')).to eq('node_a')
     end
 
     it 'updates when initialize_database_functions! is re-run' do
       stub_config(node_id: 'node_x', remote_nodes: [])
       PgLwwSync.initialize_database_functions!
-      expect(conn.select_value('SELECT pg_lww_sync.local_node_id();')).to eq('node_x')
+      expect(conn.select_value('SELECT lww_sync.local_node_id();')).to eq('node_x')
       stub_config(node_id: 'node_a', remote_nodes: [])
       PgLwwSync.initialize_database_functions!
     end
@@ -81,22 +81,22 @@ RSpec.describe 'Database functions', :integration do
       end
 
       it 'sets action_type to INSERT' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(row['action_type']).to eq('INSERT')
       end
 
       it 'stores record_id as plain UUID text' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(row['record_id']).to eq(uuid)
       end
 
       it 'does not store origin_node_id in the outbox row' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(row).not_to have_key('origin_node_id')
       end
 
       it 'stores write keys for all non-PK columns in column_timestamps' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         ts = JSON.parse(row['column_timestamps'])
         expect(ts.keys).to include('name', 'quantity')
         expect(ts.keys).not_to include('id', '__lww_ts')
@@ -111,14 +111,14 @@ RSpec.describe 'Database functions', :integration do
       end
 
       it 'write key in __lww_ts matches outbox column_timestamps' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         ts  = JSON.parse(row['column_timestamps'])
         lww = get_lww_ts(table: 'lww_test_widgets', record_id: uuid)
         expect(lww['name']).to eq(ts['name'])
       end
 
       it 'sets status to pending' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(row['status']).to eq('pending')
       end
     end
@@ -137,7 +137,7 @@ RSpec.describe 'Database functions', :integration do
 
       it 'records write key only for changed columns in column_timestamps' do
         conn.execute("UPDATE public.lww_test_widgets SET name = 'updated' WHERE id = '#{uuid}';")
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         ts  = JSON.parse(row['column_timestamps'])
         expect(ts.keys).to include('name')
         expect(ts.keys).not_to include('quantity')
@@ -166,12 +166,12 @@ RSpec.describe 'Database functions', :integration do
       end
 
       it 'writes a DELETE changeset' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(row['action_type']).to eq('DELETE')
       end
 
       it 'emits empty column_timestamps for DELETE' do
-        row = conn.select_all('SELECT * FROM pg_lww_sync.pg_lww_changesets LIMIT 1;').first
+        row = conn.select_all('SELECT * FROM lww_sync.pg_lww_changesets LIMIT 1;').first
         expect(JSON.parse(row['column_timestamps'])).to eq({})
       end
 
@@ -180,7 +180,7 @@ RSpec.describe 'Database functions', :integration do
         count = conn.select_value("SELECT COUNT(*) FROM public.lww_test_widgets WHERE id = '#{uuid}';").to_i
         expect(count).to eq(0)
         # No separate column_timings table to clean up — it doesn't exist
-        expect { conn.execute("SELECT 1 FROM pg_lww_sync.column_timings LIMIT 1;") }
+        expect { conn.execute("SELECT 1 FROM lww_sync.column_timings LIMIT 1;") }
           .to raise_error(ActiveRecord::StatementInvalid, /column_timings/)
       end
     end
@@ -193,10 +193,10 @@ RSpec.describe 'Database functions', :integration do
         expect(changeset_count).to eq(0)
       end
 
-      it 'suppresses outbox writes when pg_lww_sync.applying_replication is on' do
-        conn.execute("SET pg_lww_sync.applying_replication = 'on';")
+      it 'suppresses outbox writes when lww_sync.applying_replication is on' do
+        conn.execute("SET lww_sync.applying_replication = 'on';")
         conn.execute("INSERT INTO public.lww_test_widgets (id, name) VALUES ('#{SecureRandom.uuid}', 'silent');")
-        conn.execute("SET pg_lww_sync.applying_replication = DEFAULT;")
+        conn.execute("SET lww_sync.applying_replication = DEFAULT;")
         expect(changeset_count).to eq(0)
       end
     end
@@ -212,7 +212,7 @@ RSpec.describe 'Database functions', :integration do
     it 'raises when record_id is NULL' do
       expect {
         conn.execute(<<~SQL)
-          SELECT pg_lww_sync.apply_lww_change(
+          SELECT lww_sync.apply_lww_change(
             'public', 'lww_test_widgets', NULL, 'INSERT',
             '{}'::jsonb, '{}'::jsonb, 'node_b'
           );
@@ -359,7 +359,7 @@ RSpec.describe 'Database functions', :integration do
       missing = SecureRandom.uuid
       newer_key = write_key(node_id: 'node_b')
       conn.execute(<<~SQL)
-        SELECT pg_lww_sync.apply_lww_change(
+        SELECT lww_sync.apply_lww_change(
           'public', 'lww_test_widgets', #{conn.quote(missing)}, 'UPDATE',
           #{conn.quote("{\"id\":\"#{missing}\",\"name\":\"phantom\"}")}::jsonb,
           #{conn.quote("{\"name\":\"#{newer_key}\"}")}::jsonb,
@@ -374,7 +374,7 @@ RSpec.describe 'Database functions', :integration do
       missing = SecureRandom.uuid
       newer_key = write_key(node_id: 'node_b')
       conn.execute(<<~SQL)
-        SELECT pg_lww_sync.apply_lww_change(
+        SELECT lww_sync.apply_lww_change(
           'public', 'lww_test_widgets', #{conn.quote(missing)}, 'UPDATE',
           #{conn.quote("{\"id\":\"#{missing}\",\"name\":\"phantom\"}")}::jsonb,
           #{conn.quote("{\"name\":\"#{newer_key}\"}")}::jsonb,
@@ -405,7 +405,7 @@ RSpec.describe 'Database functions', :integration do
     def apply_delete(record_id: nil, origin: 'node_b')
       rid = record_id || uuid
       conn.execute(<<~SQL)
-        SELECT pg_lww_sync.apply_lww_change(
+        SELECT lww_sync.apply_lww_change(
           'public', 'lww_test_widgets',
           #{conn.quote(rid)}, 'DELETE',
           #{conn.quote("{\"id\":\"#{rid}\",\"name\":\"doomed\"}")}::jsonb,
@@ -437,7 +437,7 @@ RSpec.describe 'Database functions', :integration do
       apply_delete
       expect {
         conn.execute(<<~SQL)
-          SELECT pg_lww_sync.apply_lww_change(
+          SELECT lww_sync.apply_lww_change(
             'public', 'lww_test_widgets',
             #{conn.quote(uuid)}, 'UPDATE',
             #{conn.quote("{\"id\":\"#{uuid}\",\"name\":\"ghost\"}")}::jsonb,
@@ -472,7 +472,7 @@ RSpec.describe 'Database functions', :integration do
 
     def apply_unique(record_id:, email:, key:, origin: 'node_b')
       conn.execute(<<~SQL)
-        SELECT pg_lww_sync.apply_lww_change(
+        SELECT lww_sync.apply_lww_change(
           'public', 'lww_unique_test',
           #{conn.quote(record_id)}, 'INSERT',
           #{conn.quote("{\"id\":\"#{record_id}\",\"email\":\"#{email}\"}")}::jsonb,
@@ -570,7 +570,7 @@ RSpec.describe 'Database functions', :integration do
       conn.execute('DROP TABLE IF EXISTS public.lww_bad_pk;')
     end
 
-    it 'drops triggers and truncates outbox when sync disabled' do
+    it 'drops triggers when sync disabled (outbox left intact)' do
       stub_config(node_id: nil, remote_nodes: [])
       PgLwwSync.sync_all_tables!
       count = conn.select_value(<<~SQL).to_i
@@ -598,7 +598,7 @@ RSpec.describe 'Database functions', :integration do
       insert_changeset!(status: 'success', committed_at: Time.now.utc - 8.days, transaction_id: 2)
       insert_changeset!(status: 'success', committed_at: Time.now.utc - 1.day,  transaction_id: 3)
       cutoff = PgLwwSync::Consumer::PRUNE_RETAIN_DAYS.days.ago
-      conn.execute("DELETE FROM pg_lww_sync.pg_lww_changesets WHERE status = 'success' AND committed_at < '#{cutoff.iso8601}';")
+      conn.execute("DELETE FROM lww_sync.pg_lww_changesets WHERE status = 'success' AND committed_at < '#{cutoff.iso8601}';")
       expect(changeset_count(status: 'success')).to eq(1)
     end
 
@@ -606,7 +606,7 @@ RSpec.describe 'Database functions', :integration do
       insert_changeset!(status: 'pending', committed_at: Time.now.utc - 8.days, transaction_id: 10)
       insert_changeset!(status: 'success', committed_at: Time.now.utc - 8.days, transaction_id: 11)
       cutoff = PgLwwSync::Consumer::PRUNE_RETAIN_DAYS.days.ago
-      conn.execute("DELETE FROM pg_lww_sync.pg_lww_changesets WHERE status = 'success' AND committed_at < '#{cutoff.iso8601}';")
+      conn.execute("DELETE FROM lww_sync.pg_lww_changesets WHERE status = 'success' AND committed_at < '#{cutoff.iso8601}';")
       expect(changeset_count(status: 'pending')).to eq(1)
     end
   end

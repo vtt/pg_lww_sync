@@ -139,9 +139,15 @@ module PgLwwSync
           idx = chain_indices.first
           chains[idx] << [transaction_id, tx_rows]
         else
-          # Records span multiple chains — merge them all into the first one
+          # Records span multiple chains — merge them all into the one with
+          # the smallest index. chain_indices is NOT sorted (it reflects
+          # whatever order record_ids happen to appear in for this
+          # transaction), so we must explicitly exclude idx itself here —
+          # dropping the array's first element instead of the min would
+          # sometimes leave idx in the merge list, causing chains[idx] to be
+          # concatenated with itself and then nulled out mid-merge.
           idx = chain_indices.min
-          chain_indices.drop(1).each do |other_idx|
+          (chain_indices - [idx]).each do |other_idx|
             chains[idx].concat(chains[other_idx])
             chains[other_idx] = nil  # mark as merged
             # Re-point all records from the merged chain to the surviving one
@@ -324,7 +330,7 @@ module PgLwwSync
       # deep × worker threads × pool_size_per_node).
       execute_delivery = lambda do |conn|
         conn.transaction do
-          conn.execute("SET LOCAL pg_lww_sync.applying_replication = 'on';")
+          conn.execute("SET LOCAL lww_sync.applying_replication = 'on';")
           deliverable_rows.each { |row| conn.execute(format_lww_sql_call(row, target_node_id)) }
         end
         @local_db_mutex.synchronize do
@@ -497,7 +503,7 @@ module PgLwwSync
       conn = ActiveRecord::Base.connection
       # record_id is the plain UUID text (tables require a single UUID 'id' PK)
       <<~SQL
-        SELECT pg_lww_sync.apply_lww_change(
+        SELECT lww_sync.apply_lww_change(
           #{conn.quote(row['table_schema'])},
           #{conn.quote(row['table_name'])},
           #{conn.quote(row['record_id'])},

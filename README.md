@@ -139,6 +139,18 @@ production:
       password: "<%= ENV['EU_DB_PASSWORD'] %>"
       port: 5432
       pool: 15
+      # Seconds to wait for the initial TCP connection before giving up.
+      # Default: 5. Keep this low — a partitioned peer that silently drops
+      # packets (rather than refusing the connection outright) can otherwise
+      # hang a worker thread for the OS's default TCP connect timeout, which
+      # is often minutes, and since a worker delivers to every configured
+      # remote node sequentially before returning to the queue, that can
+      # stall delivery to your other, healthy peers too.
+      connect_timeout: 5
+      # Milliseconds a single query to this peer may run before Postgres
+      # cancels it. Default: 30000 (30s). Same rationale as connect_timeout —
+      # bounds how long one wedged peer can tie up a worker.
+      statement_timeout: 30000
 
     - node_id: "ap_south_primary"
       adapter: "postgresql"
@@ -434,7 +446,7 @@ Use `pg_dump` to take a consistent snapshot of the data from any existing live n
 ```bash
 pg_dump \
   --no-owner --no-acl \
-  --exclude-table=pg_lww_sync.pg_lww_changesets \
+  --exclude-table=lww_sync.pg_lww_changesets \
   --format=custom \
   postgres://existing-node/db \
   > snapshot.dump
@@ -526,7 +538,7 @@ SELECT
   status,
   processed_nodes,
   committed_at
-FROM pg_lww_sync.pg_lww_changesets
+FROM lww_sync.pg_lww_changesets
 ORDER BY committed_at DESC
 LIMIT 20;
 ```
@@ -551,12 +563,18 @@ New rows should show `processed_nodes` containing an entry for every node includ
 
 ## Production Maintenance & Rake Tasks
 
-### Replaying Failed Quarantined Transactions
-Once you address structural schema alignment differences on a lagging node (by running the necessary database migration), you can instruct `PgLwwSync` to flush and retry the quarantined outbox rows back into active synchronization pipeline processing by running:
+### Recovering Failed Quarantined Transactions
+There is currently no rake task that automatically re-delivers quarantined changesets. Once a target node's schema is fixed (e.g. the missing migration has been run), a quarantined row for that node — visible via `rails pg_lww_sync:status` or by querying `processed_nodes` on `lww_sync.pg_lww_changesets` — will **not** be retried automatically. To recover, either:
 
-```bash
-bundle exec rake pg_lww_sync:replay_failed
-```
+- Manually reset the per-node entry so the consumer picks the row back up on its next poll, e.g.:
+  ```sql
+  UPDATE lww_sync.pg_lww_changesets
+  SET processed_nodes = processed_nodes - 'eu_west_primary',
+      status = 'pending'
+  WHERE processed_nodes->>'eu_west_primary' = 'failed';
+  ```
+  (only do this after confirming the schema mismatch that caused the failure is actually fixed on that node — otherwise it will just fail again), or
+- Restore the affected node from a fresh snapshot of a healthy peer (see [Adding a New Node to an Existing Cluster](#adding-a-new-node-to-an-existing-cluster)), which sidesteps replaying old changesets entirely.
 
 ### Manual Realignment Triggering
 If you perform extensive manual DDL operations, deploy massive schema changes outside normal ActiveRecord migrations, or introduce new structural tables, you can force a cold recompile and realign tracking vectors across all schemas by running:
@@ -617,7 +635,7 @@ When configuring alert routing logic or troubleshooting issues caught by your ca
 * **`PG::DatatypeMismatch`:** Triggered if database column type updates diverge or are misaligned between regional clusters (e.g., attempting to stream alphanumeric characters into a field that a peer node still enforces as an integer scalar).
 * **`PG::StringDataRightTruncation`:** Occurs when character threshold boundaries differ across target nodes (e.g., Node A saves a 120-character string into a field defined as `text`, but Node B rejects it because its local table configuration still binds that field to a restricted `varchar(50)` limit constraint).
 
-**Resolution Procedure:** Once you receive a schema mismatch alert from your tracker, simply bring the target node's database catalog into alignment by running the missing migration setup steps. Once aligned, run `rake pg_lww_sync:replay_failed` to clear out the quarantine queue.
+**Resolution Procedure:** Once you receive a schema mismatch alert from your tracker, bring the target node's database catalog into alignment by running the missing migration setup steps. Once aligned, see [Recovering Failed Quarantined Transactions](#recovering-failed-quarantined-transactions) to clear out the quarantine queue for that node.
 
 ---
 

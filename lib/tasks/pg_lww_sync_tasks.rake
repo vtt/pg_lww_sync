@@ -6,7 +6,7 @@ namespace :pg_lww_sync do
       PgLwwSync.initialize_database_functions!
       puts "Scanning tables and attaching triggers..."
     else
-      puts "PgLwwSync: Sync disabled (node_id not set) — dropping triggers and truncating outbox."
+      puts "PgLwwSync: Sync disabled (node_id not set) — dropping triggers. Outbox left intact."
     end
 
     PgLwwSync.sync_all_tables!

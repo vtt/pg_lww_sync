@@ -39,7 +39,16 @@ module PgLwwSync
         password: node_config[:password],
         database: node_config[:database],
         port:     node_config[:port]     || 5432,
-        pool:     node_config[:pool]     || 5
+        pool:     node_config[:pool]     || 5,
+        # Without these, a partitioned/blackholed peer (packets silently
+        # dropped rather than refused) can hang a worker thread for the OS's
+        # TCP connect timeout (often minutes), or for as long as a wedged
+        # remote query takes. Since a worker processes one whole chain —
+        # including every configured remote node, sequentially — before
+        # returning to the queue, that can tie up the entire worker pool and
+        # stall delivery to every other healthy peer too, not just this one.
+        connect_timeout: node_config[:connect_timeout] || 5,
+        variables: { statement_timeout: node_config[:statement_timeout] || 30_000 }
       )
       connection_class
     end

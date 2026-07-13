@@ -1,13 +1,13 @@
 module DatabaseHelpers
   # ---------------------------------------------------------------------------
-  # Schema bootstrap — creates the pg_lww_sync schema and outbox table.
+  # Schema bootstrap — creates the lww_sync schema and outbox table.
   # __lww_ts is an inline JSONB column on application tables — no column_timings.
   # ---------------------------------------------------------------------------
   def bootstrap_pg_lww_sync_schema!
     conn = ActiveRecord::Base.connection
-    conn.execute("CREATE SCHEMA IF NOT EXISTS pg_lww_sync;")
+    conn.execute("CREATE SCHEMA IF NOT EXISTS lww_sync;")
     conn.execute(<<~SQL)
-      CREATE TABLE IF NOT EXISTS pg_lww_sync.pg_lww_changesets (
+      CREATE TABLE IF NOT EXISTS lww_sync.pg_lww_changesets (
         id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
         table_schema     TEXT        NOT NULL,
         table_name       TEXT        NOT NULL,
@@ -23,17 +23,17 @@ module DatabaseHelpers
     SQL
     conn.execute(<<~SQL)
       CREATE INDEX IF NOT EXISTS idx_lww_changesets_status_committed
-        ON pg_lww_sync.pg_lww_changesets (status, committed_at);
+        ON lww_sync.pg_lww_changesets (status, committed_at);
     SQL
   end
 
   def drop_pg_lww_sync_schema!
-    ActiveRecord::Base.connection.execute("DROP SCHEMA IF EXISTS pg_lww_sync CASCADE;")
+    ActiveRecord::Base.connection.execute("DROP SCHEMA IF EXISTS lww_sync CASCADE;")
   end
 
   def clean_pg_lww_sync_tables!
     conn = ActiveRecord::Base.connection
-    conn.execute("TRUNCATE pg_lww_sync.pg_lww_changesets;")
+    conn.execute("TRUNCATE lww_sync.pg_lww_changesets;")
   end
 
   # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ module DatabaseHelpers
   )
     conn = ActiveRecord::Base.connection
     conn.execute(<<~SQL)
-      INSERT INTO pg_lww_sync.pg_lww_changesets
+      INSERT INTO lww_sync.pg_lww_changesets
         (table_schema, table_name, record_id, action_type,
          changed_fields, column_timestamps, transaction_id,
          committed_at, processed_nodes, status)
@@ -120,7 +120,7 @@ module DatabaseHelpers
   # ---------------------------------------------------------------------------
   def changeset_count(status: nil)
     conn = ActiveRecord::Base.connection
-    sql  = "SELECT COUNT(*) FROM pg_lww_sync.pg_lww_changesets"
+    sql  = "SELECT COUNT(*) FROM lww_sync.pg_lww_changesets"
     sql += " WHERE status = #{conn.quote(status)}" if status
     conn.select_value(sql).to_i
   end

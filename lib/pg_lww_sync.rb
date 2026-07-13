@@ -4,9 +4,9 @@ require_relative "pg_lww_sync/version"
 require_relative "pg_lww_sync/railtie" if defined?(Rails)
 
 module PgLwwSync
-  SYSTEM_SCHEMAS = %w[pg_catalog information_schema pg_lww_sync pg_toast].freeze
+  SYSTEM_SCHEMAS = %w[pg_catalog information_schema lww_sync pg_toast].freeze
   SYSTEM_TABLES  = %w[schema_migrations ar_internal_metadata].freeze
-  TARGET_CHANGESET_TABLE = "pg_lww_sync.pg_lww_changesets"
+  TARGET_CHANGESET_TABLE = "lww_sync.pg_lww_changesets"
 
   # node_id must be safe to embed in SQL identifiers / JSON keys
   NODE_ID_FORMAT = /\A[a-z0-9_]{1,64}\z/i
@@ -156,8 +156,11 @@ module PgLwwSync
     # Composite PKs, non-UUID PKs, differently-named PKs, partitioned tables, and
     # foreign tables are all skipped with a warning.
     #
-    # When sync is disabled, drops triggers and truncates the outbox and
-    # stale changesets accumulate.
+    # When sync is disabled, drops triggers. The outbox table itself is left
+    # alone — it is not truncated — since pending rows may still be undelivered
+    # to some peers. If you are certain sync is permanently retired and no
+    # longer need the outbox history, drop/truncate
+    # lww_sync.pg_lww_changesets manually.
     def sync_all_tables!
       conn = ActiveRecord::Base.connection
 
@@ -238,7 +241,7 @@ module PgLwwSync
             DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{qualified_table};
             CREATE TRIGGER c_pg_lww_sync_tg
             BEFORE INSERT OR UPDATE OR DELETE ON #{qualified_table}
-            FOR EACH ROW EXECUTE PROCEDURE pg_lww_sync.log_lww_sync_changeset();
+            FOR EACH ROW EXECUTE PROCEDURE lww_sync.log_lww_sync_changeset();
           SQL
         else
           conn.execute("DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{qualified_table};")
@@ -246,8 +249,8 @@ module PgLwwSync
       end
 
       unless sync_enabled?
-        conn.execute("TRUNCATE #{TARGET_CHANGESET_TABLE};")
-        Rails.logger.info "[PgLwwSync] Sync disabled — triggers dropped and outbox truncated."
+        Rails.logger.info "[PgLwwSync] Sync disabled — triggers dropped. Outbox left intact; " \
+                           "drop lww_sync.pg_lww_changesets manually if it's no longer needed."
       end
     end
 
@@ -263,7 +266,7 @@ module PgLwwSync
       # are running on. The trigger function and apply_lww_change are static
       # SQL installed once by the migration.
       ActiveRecord::Base.connection.execute(<<~SQL)
-        CREATE OR REPLACE FUNCTION pg_lww_sync.local_node_id()
+        CREATE OR REPLACE FUNCTION lww_sync.local_node_id()
         RETURNS CHARACTER VARYING AS $$
         BEGIN
           RETURN #{quoted_node_id}::character varying;
