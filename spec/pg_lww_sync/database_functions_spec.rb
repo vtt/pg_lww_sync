@@ -587,6 +587,79 @@ RSpec.describe 'Database functions', :integration do
       expect { PgLwwSync.sync_all_tables! }.not_to raise_error
       expect { PgLwwSync.sync_all_tables! }.not_to raise_error
     end
+
+    context 'excluded_tables' do
+      after { stub_config(node_id: 'node_a', remote_nodes: []) }
+
+      it 'does not attach a trigger to a table listed by plain name' do
+        stub_config(node_id: 'node_a', remote_nodes: [], excluded_tables: ['lww_trigger_check'])
+        PgLwwSync.sync_all_tables!
+        count = conn.select_value(<<~SQL).to_i
+          SELECT COUNT(*) FROM pg_trigger
+          WHERE tgname = 'c_pg_lww_sync_tg'
+            AND tgrelid = 'public.lww_trigger_check'::regclass;
+        SQL
+        expect(count).to eq(0)
+      end
+
+      it 'does not attach a trigger to a table listed by schema-qualified name' do
+        stub_config(node_id: 'node_a', remote_nodes: [], excluded_tables: ['public.lww_trigger_check'])
+        PgLwwSync.sync_all_tables!
+        count = conn.select_value(<<~SQL).to_i
+          SELECT COUNT(*) FROM pg_trigger
+          WHERE tgname = 'c_pg_lww_sync_tg'
+            AND tgrelid = 'public.lww_trigger_check'::regclass;
+        SQL
+        expect(count).to eq(0)
+      end
+
+      it 'does not exclude a different table with the same name in another schema' do
+        conn.execute('CREATE SCHEMA IF NOT EXISTS other_schema;')
+        conn.execute(<<~SQL)
+          CREATE TABLE IF NOT EXISTS other_schema.lww_trigger_check (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+          );
+        SQL
+
+        stub_config(node_id: 'node_a', remote_nodes: [], excluded_tables: ['public.lww_trigger_check'])
+        PgLwwSync.sync_all_tables!
+
+        other_count = conn.select_value(<<~SQL).to_i
+          SELECT COUNT(*) FROM pg_trigger
+          WHERE tgname = 'c_pg_lww_sync_tg'
+            AND tgrelid = 'other_schema.lww_trigger_check'::regclass;
+        SQL
+        expect(other_count).to eq(1)
+      ensure
+        conn.execute('DROP TABLE IF EXISTS other_schema.lww_trigger_check;')
+        conn.execute('DROP SCHEMA IF EXISTS other_schema;')
+      end
+
+      it 'drops a leftover trigger when a previously-synced table is newly excluded' do
+        stub_config(node_id: 'node_a', remote_nodes: [])
+        PgLwwSync.sync_all_tables!
+        count = conn.select_value(<<~SQL).to_i
+          SELECT COUNT(*) FROM pg_trigger
+          WHERE tgname = 'c_pg_lww_sync_tg'
+            AND tgrelid = 'public.lww_trigger_check'::regclass;
+        SQL
+        expect(count).to eq(1) # sanity check: it was syncing before
+
+        stub_config(node_id: 'node_a', remote_nodes: [], excluded_tables: ['lww_trigger_check'])
+        PgLwwSync.sync_all_tables!
+        count = conn.select_value(<<~SQL).to_i
+          SELECT COUNT(*) FROM pg_trigger
+          WHERE tgname = 'c_pg_lww_sync_tg'
+            AND tgrelid = 'public.lww_trigger_check'::regclass;
+        SQL
+        expect(count).to eq(0)
+      end
+
+      it 'does not error when sync is disabled and excluded_tables is also set' do
+        stub_config(node_id: nil, remote_nodes: [], excluded_tables: ['lww_trigger_check'])
+        expect { PgLwwSync.sync_all_tables! }.not_to raise_error
+      end
+    end
   end
 
   # -------------------------------------------------------------------------

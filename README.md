@@ -160,6 +160,27 @@ production:
       password: "<%= ENV['AP_DB_PASSWORD'] %>"
       port: 5432
       pool: 15
+
+  # Table names to exclude from sync entirely — no trigger is ever attached
+  # to these tables, regardless of PK shape, even if they'd otherwise be
+  # eligible. Useful for tables that are intentionally node-local: per-region
+  # caches, Sidekiq/Delayed::Job queue tables, audit logs you don't want
+  # replicated, etc.
+  #
+  # Accepts either a plain table name ("jobs") or a schema-qualified
+  # "schema.table" form, which lets you exclude the table in one schema
+  # while still syncing a same-named table that lives in a different schema.
+  #
+  # IMPORTANT: this list is per-node config, and exclusion only stops THIS
+  # node from being a *source* of changes for the listed tables — it does
+  # not stop this node from being a *destination*. If a table is excluded
+  # here but a remote node still has it enabled, that remote node's writes
+  # for that table are replicated in via apply_lww_change regardless. Keep
+  # excluded_tables identical across every node's config to actually take
+  # a table out of sync cluster-wide.
+  excluded_tables:
+    - "delayed_jobs"
+    - "reporting.materialized_cache"
 ```
 
 ---

@@ -58,9 +58,11 @@ RSpec.describe PgLwwSync::RequestRouter do
   end
 
   # -------------------------------------------------------------------------
-  # PG::ConnectionBad — always retryable regardless of HTTP method
+  # ActiveRecord::ConnectionNotEstablished — the one error Rails only raises
+  # when it's certain the query was never sent, so it's safe to retry
+  # regardless of HTTP method.
   # -------------------------------------------------------------------------
-  describe '#call — PG::ConnectionBad retry' do
+  describe '#call — ActiveRecord::ConnectionNotEstablished retry' do
     let(:second_config) { primary_config.merge(node_id: 'node_b') }
 
     before { allow(PgLwwSync::Consensus).to receive(:invalidate_fast_path!) }
@@ -69,7 +71,7 @@ RSpec.describe PgLwwSync::RequestRouter do
       call_count = 0
       allow(ActiveRecord::Base).to receive(:connected_to) do
         call_count += 1
-        raise PG::ConnectionBad, 'refused' if call_count == 1
+        raise ActiveRecord::ConnectionNotEstablished, 'refused' if call_count == 1
         [200, {}, ['OK']]
       end
       allow(PgLwwSync::Consensus).to receive(:determine_active_primary)
@@ -78,11 +80,11 @@ RSpec.describe PgLwwSync::RequestRouter do
       expect { router.call(get_env) }.not_to raise_error
     end
 
-    it 'retries on POST — connection never opened so no write committed' do
+    it 'retries on POST — Rails only raises this when the query was never sent' do
       call_count = 0
       allow(ActiveRecord::Base).to receive(:connected_to) do
         call_count += 1
-        raise PG::ConnectionBad, 'refused' if call_count == 1
+        raise ActiveRecord::ConnectionNotEstablished, 'refused' if call_count == 1
         [200, {}, ['OK']]
       end
       allow(PgLwwSync::Consensus).to receive(:determine_active_primary)
@@ -95,7 +97,7 @@ RSpec.describe PgLwwSync::RequestRouter do
       call_count = 0
       allow(ActiveRecord::Base).to receive(:connected_to) do
         call_count += 1
-        raise PG::ConnectionBad, 'gone' if call_count == 1
+        raise ActiveRecord::ConnectionNotEstablished, 'gone' if call_count == 1
         [200, {}, ['OK']]
       end
 
@@ -109,11 +111,92 @@ RSpec.describe PgLwwSync::RequestRouter do
 
     it 're-raises after exhausting all nodes' do
       allow(ActiveRecord::Base).to receive(:connected_to)
-        .and_raise(PG::ConnectionBad, 'all down')
+        .and_raise(ActiveRecord::ConnectionNotEstablished, 'all down')
 
-      expect { router.call(get_env) }.to raise_error(PG::ConnectionBad)
+      expect { router.call(get_env) }.to raise_error(ActiveRecord::ConnectionNotEstablished)
     end
   end
+
+  # -------------------------------------------------------------------------
+  # PG::ConnectionBad — ambiguous (may have fired mid-query on some Rails
+  # versions/paths), so only retried for idempotent methods, same as
+  # StatementInvalid — NOT the same treatment as ConnectionNotEstablished.
+  # -------------------------------------------------------------------------
+  describe '#call — PG::ConnectionBad retry' do
+    before { allow(PgLwwSync::Consensus).to receive(:invalidate_fast_path!) }
+
+    context 'GET request' do
+      it 'retries and succeeds' do
+        call_count = 0
+        allow(ActiveRecord::Base).to receive(:connected_to) do
+          call_count += 1
+          raise PG::ConnectionBad, 'refused' if call_count == 1
+          [200, {}, ['OK']]
+        end
+        expect { router.call(get_env) }.not_to raise_error
+      end
+    end
+
+    context 'POST request' do
+      it 'does not retry — raises immediately to prevent a possible duplicate write' do
+        allow(ActiveRecord::Base).to receive(:connected_to)
+          .and_raise(PG::ConnectionBad, 'gone')
+
+        expect { router.call(post_env) }.to raise_error(PG::ConnectionBad)
+      end
+
+      it 'logs a warning about the non-retry' do
+        allow(ActiveRecord::Base).to receive(:connected_to)
+          .and_raise(PG::ConnectionBad, 'gone')
+
+        expect(Rails.logger).to receive(:error).with(/Not retrying POST/)
+        router.call(post_env) rescue nil
+      end
+    end
+
+    %w[PUT DELETE].each do |method|
+      context "#{method} request" do
+        it 'does not retry' do
+          allow(ActiveRecord::Base).to receive(:connected_to)
+            .and_raise(PG::ConnectionBad, 'gone')
+
+          expect { router.call({ 'REQUEST_METHOD' => method }) }
+            .to raise_error(PG::ConnectionBad)
+        end
+      end
+    end
+  end
+
+  # -------------------------------------------------------------------------
+  # ActiveRecord::ConnectionFailed — only defined on some Rails versions.
+  # Same idempotent-only treatment as PG::ConnectionBad/StatementInvalid.
+  # -------------------------------------------------------------------------
+  describe '#call — ActiveRecord::ConnectionFailed retry', if: defined?(ActiveRecord::ConnectionFailed) do
+    before { allow(PgLwwSync::Consensus).to receive(:invalidate_fast_path!) }
+
+    it 'is included in AMBIGUOUS_CONNECTION_ERRORS' do
+      expect(described_class::AMBIGUOUS_CONNECTION_ERRORS).to include(ActiveRecord::ConnectionFailed)
+    end
+
+    it 'retries on GET' do
+      call_count = 0
+      allow(ActiveRecord::Base).to receive(:connected_to) do
+        call_count += 1
+        raise ActiveRecord::ConnectionFailed, 'mid-query' if call_count == 1
+        [200, {}, ['OK']]
+      end
+      expect { router.call(get_env) }.not_to raise_error
+    end
+
+    it 'does not retry on POST' do
+      allow(ActiveRecord::Base).to receive(:connected_to)
+        .and_raise(ActiveRecord::ConnectionFailed, 'mid-query')
+
+      expect { router.call(post_env) }.to raise_error(ActiveRecord::ConnectionFailed)
+    end
+  end
+
+
 
   # -------------------------------------------------------------------------
   # StatementInvalid — only retryable for idempotent methods

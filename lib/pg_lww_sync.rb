@@ -30,6 +30,15 @@ module PgLwwSync
       config[:remote_nodes] || []
     end
 
+    # Table names (or "schema.table" for precision when the same table name
+    # exists in multiple schemas) to exclude from sync entirely — no trigger
+    # is ever attached, regardless of PK shape. Useful for tables that are
+    # intentionally node-local (e.g. per-region caches, Sidekiq/Delayed::Job
+    # tables, audit logs you don't want replicated).
+    def excluded_tables
+      config[:excluded_tables] || []
+    end
+
     def on_failure(&block)
       @on_replication_failure = block
     end
@@ -91,7 +100,17 @@ module PgLwwSync
             database: node_config[:database],
             username: node_config[:username],
             password: node_config[:password],
-            pool:     node_config[:pool]     || 5
+            pool:     node_config[:pool]     || 5,
+            # Without these, a partitioned/blackholed primary (packets
+            # silently dropped rather than refused) can hang a live HTTP
+            # request for the OS's TCP connect timeout (often minutes),
+            # instead of failing fast into RequestRouter's blacklist-and-retry
+            # logic that exists specifically to handle this case. This is the
+            # same fix applied to ReplicationClient's connections, but it
+            # matters more here since it's on the user-facing request path
+            # rather than a background worker.
+            connect_timeout: node_config[:connect_timeout] || 5,
+            variables: { statement_timeout: node_config[:statement_timeout] || 30_000 }
           },
           owner_name: "ActiveRecord::Base",
           role:       role
@@ -136,6 +155,11 @@ module PgLwwSync
       if node_ids.include?(node_id.to_s)
         raise "[PgLwwSync] CONFIGURATION ERROR: local node_id #{node_id.inspect} " \
               "also appears in remote_nodes. Each node must have a unique identifier."
+      end
+
+      unless excluded_tables.all? { |t| t.is_a?(String) }
+        raise "[PgLwwSync] CONFIGURATION ERROR: excluded_tables must be an array of strings, " \
+              "got #{excluded_tables.inspect}."
       end
     end
 
@@ -184,6 +208,17 @@ module PgLwwSync
       tables.each do |schema, table|
         # Properly build a schema-qualified identifier using separate quoting
         qualified_table = "#{conn.quote_table_name(schema)}.#{conn.quote_table_name(table)}"
+
+        if excluded_table?(schema, table)
+          if sync_enabled?
+            # Drop any trigger left over from before this table was excluded —
+            # otherwise adding a table to excluded_tables after it was already
+            # syncing would leave it silently replicating regardless.
+            conn.execute("DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{qualified_table};")
+          end
+          Rails.logger.info "[PgLwwSync] Skipping excluded table: #{schema}.#{table}"
+          next
+        end
 
         # Skip partitioned tables
         is_partitioned = conn.select_value(<<~SQL)
@@ -277,6 +312,15 @@ module PgLwwSync
 
     private
 
+    # Matches a table against the configured excluded_tables list. Supports
+    # both a plain table name ("jobs") and a schema-qualified form
+    # ("reporting.jobs") for precision when the same table name exists in
+    # more than one schema. Comparison is case-sensitive to match Postgres
+    # identifier semantics for quoted/mixed-case names.
+    def excluded_table?(schema, table)
+      excluded_tables.include?(table) || excluded_tables.include?("#{schema}.#{table}")
+    end
+
     def load_config_file!
       config_path = Rails.root.join("config", "pg_lww_sync.yml")
 
@@ -297,6 +341,7 @@ module PgLwwSync
       {
         node_id:                env_config["node_id"],
         remote_nodes:           (env_config["remote_nodes"] || []).map(&:symbolize_keys),
+        excluded_tables:        (env_config["excluded_tables"] || []).map(&:to_s),
         worker_threads:         env_config["worker_threads"],
         prune_retain_days:      env_config["prune_retain_days"],
         prune_interval_seconds: env_config["prune_interval_seconds"]

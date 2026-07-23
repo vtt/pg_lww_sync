@@ -44,6 +44,24 @@ module PgLwwSync
               #   password: "<%= ENV['EU_DB_PASSWORD'] %>"
               #   port: 5432
               #   pool: 15
+
+            # Table names to exclude from sync entirely — no trigger is ever
+            # attached, regardless of PK shape. Useful for tables that are
+            # intentionally node-local (per-region caches, Sidekiq/Delayed::Job
+            # queue tables, audit logs you don't want replicated). Use
+            # "schema.table" instead of a plain table name if the same table
+            # name exists in more than one schema and you only want to
+            # exclude it in one of them.
+            #
+            # IMPORTANT: keep this list identical across every node's config.
+            # A table excluded on this node but still synced on a remote node
+            # will have that remote node's writes replicated in via
+            # apply_lww_change regardless — exclusion only stops this node
+            # from being a *source* of changes for that table, not a
+            # destination.
+            excluded_tables: []
+              # - "delayed_jobs"
+              # - "reporting.materialized_cache"
         YAML
       end
     end

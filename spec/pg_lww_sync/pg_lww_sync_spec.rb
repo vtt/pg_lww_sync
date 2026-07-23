@@ -125,6 +125,16 @@ RSpec.describe PgLwwSync do
       )
       expect { PgLwwSync.assert_valid_configuration! }.to raise_error(RuntimeError, /invalid/)
     end
+
+    it 'passes when excluded_tables is an array of strings' do
+      stub_config(node_id: 'local_node', excluded_tables: ['jobs', 'reporting.cache'])
+      expect { PgLwwSync.assert_valid_configuration! }.not_to raise_error
+    end
+
+    it 'raises when excluded_tables contains a non-string element' do
+      stub_config(node_id: 'local_node', excluded_tables: ['jobs', :cache])
+      expect { PgLwwSync.assert_valid_configuration! }.to raise_error(RuntimeError, /excluded_tables/i)
+    end
   end
 
   # -------------------------------------------------------------------------
@@ -189,6 +199,59 @@ RSpec.describe PgLwwSync do
           .and_raise(RuntimeError, 'no healthy node')
         expect { PgLwwSync.with_primary { } }.to raise_error(PgLwwSync::NoPrimaryError)
       end
+    end
+  end
+
+  # -------------------------------------------------------------------------
+  # ensure_connection_pool_registered! — regression coverage for
+  # connect_timeout/statement_timeout being passed through to
+  # establish_connection, so a partitioned/blackholed primary can't hang a
+  # live HTTP request indefinitely.
+  # -------------------------------------------------------------------------
+  describe '.ensure_connection_pool_registered!' do
+    let(:node_config) do
+      { node_id: 'node_a', host: 'db.internal', port: 5432,
+        database: 'app_db', username: 'u', password: 'p' }
+    end
+    let(:handler) { ActiveRecord::Base.connection_handler }
+
+    before do
+      allow(handler).to receive(:retrieve_connection_pool).and_return(nil)
+      allow(handler).to receive(:establish_connection)
+    end
+
+    it 'sets a default connect_timeout of 5 seconds' do
+      expect(handler).to receive(:establish_connection) do |config, **|
+        expect(config[:connect_timeout]).to eq(5)
+      end
+      PgLwwSync.ensure_connection_pool_registered!(node_config)
+    end
+
+    it 'sets a default statement_timeout of 30000ms via the variables hash' do
+      expect(handler).to receive(:establish_connection) do |config, **|
+        expect(config[:variables]).to eq(statement_timeout: 30_000)
+      end
+      PgLwwSync.ensure_connection_pool_registered!(node_config)
+    end
+
+    it 'allows connect_timeout to be overridden per-node' do
+      expect(handler).to receive(:establish_connection) do |config, **|
+        expect(config[:connect_timeout]).to eq(2)
+      end
+      PgLwwSync.ensure_connection_pool_registered!(node_config.merge(connect_timeout: 2))
+    end
+
+    it 'allows statement_timeout to be overridden per-node' do
+      expect(handler).to receive(:establish_connection) do |config, **|
+        expect(config[:variables]).to eq(statement_timeout: 5_000)
+      end
+      PgLwwSync.ensure_connection_pool_registered!(node_config.merge(statement_timeout: 5_000))
+    end
+
+    it 'does not re-register a pool that already exists for that role' do
+      allow(handler).to receive(:retrieve_connection_pool).and_return(double('pool'))
+      expect(handler).not_to receive(:establish_connection)
+      PgLwwSync.ensure_connection_pool_registered!(node_config)
     end
   end
 

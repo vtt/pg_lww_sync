@@ -1,8 +1,9 @@
 module ConfigHelpers
-  def stub_config(node_id: 'test_node', remote_nodes: [])
+  def stub_config(node_id: 'test_node', remote_nodes: [], excluded_tables: [])
     PgLwwSync.instance_variable_set(:@config, {
-      node_id:      node_id,
-      remote_nodes: remote_nodes
+      node_id:         node_id,
+      remote_nodes:    remote_nodes,
+      excluded_tables: excluded_tables
     })
   end
 
